@@ -38,6 +38,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     archive.set_config(Lzma2Config {
         preset: cli.level,
         dict_size: None,
+        block_size: None,
     });
 
     for path in &cli.files {

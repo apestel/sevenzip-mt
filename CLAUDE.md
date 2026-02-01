@@ -201,7 +201,7 @@ Implémenter des fonctionnalités non demandées
 
 Modifier le scope sans instruction explicite
 
-Optimiser prématurément
+Optimiser au détriment de la clarté ou de la validité du format
 
 “Deviner” le format 7z
 
@@ -219,4 +219,4 @@ ce qu’elle ne fait pas
 
 14. Principe directeur
 
-La validité du format et la clarté du code priment sur la performance.
+La validité du format et la clarté du code priment sur la performance. Les optimisations sont autorisées tant qu'elles ne compromettent ni la validité ni la lisibilité.

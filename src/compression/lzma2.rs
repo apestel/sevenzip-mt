@@ -9,6 +9,10 @@ pub struct Lzma2Config {
     pub preset: u32,
     /// Dictionary size in bytes. If `None`, uses the default for the preset.
     pub dict_size: Option<u32>,
+    /// Block size for intra-file parallel compression.
+    /// Files larger than this are split into blocks compressed in parallel.
+    /// If `None`, defaults to `2 × dict_size` (minimum 1 MiB).
+    pub block_size: Option<usize>,
 }
 
 impl Default for Lzma2Config {
@@ -16,6 +20,7 @@ impl Default for Lzma2Config {
         Self {
             preset: 6,
             dict_size: None,
+            block_size: None,
         }
     }
 }
@@ -33,6 +38,13 @@ impl Lzma2Config {
     pub fn effective_dict_size(&self) -> u32 {
         let opts = self.to_lzma2_options();
         opts.lzma_options.dict_size
+    }
+
+    /// Returns the effective block size for intra-file splitting.
+    /// Defaults to `2 × dict_size`, minimum 1 MiB.
+    pub fn effective_block_size(&self) -> usize {
+        self.block_size
+            .unwrap_or_else(|| (2 * self.effective_dict_size() as usize).max(1 << 20))
     }
 }
 
@@ -77,6 +89,50 @@ fn decode_dict_size(prop: u8) -> u32 {
     } else {
         size as u32
     }
+}
+
+/// LZMA2 end-of-stream marker byte.
+const LZMA2_END_MARKER: u8 = 0x00;
+
+/// Concatenates multiple independently-compressed LZMA2 streams into a single
+/// valid LZMA2 stream by stripping intermediate end-of-stream markers.
+///
+/// Each input stream must be a valid LZMA2 stream ending with the `0x00`
+/// end-of-stream marker. The result decompresses to the concatenation of all
+/// input streams' decompressed data.
+pub fn concatenate_lzma2_streams(streams: Vec<Vec<u8>>) -> Result<Vec<u8>> {
+    if streams.is_empty() {
+        return Ok(vec![LZMA2_END_MARKER]);
+    }
+
+    for stream in &streams {
+        if stream.last() != Some(&LZMA2_END_MARKER) {
+            return Err(SevenZipError::Compression(
+                "invalid LZMA2 stream: missing end-of-stream marker".to_string(),
+            ));
+        }
+    }
+
+    if streams.len() == 1 {
+        let mut streams = streams;
+        return Ok(streams.swap_remove(0));
+    }
+
+    let last_index = streams.len() - 1;
+    let total_size: usize = streams.iter().map(|s| s.len()).sum::<usize>() - last_index;
+    let mut result = Vec::with_capacity(total_size);
+
+    for (i, stream) in streams.iter().enumerate() {
+        if i < last_index {
+            // Strip the trailing 0x00 end marker from intermediate streams
+            result.extend_from_slice(&stream[..stream.len() - 1]);
+        } else {
+            // Keep the last stream complete (with its terminator)
+            result.extend_from_slice(stream);
+        }
+    }
+
+    Ok(result)
 }
 
 /// Compresses a data block using LZMA2.
@@ -142,5 +198,72 @@ mod tests {
         let config = Lzma2Config::default();
         let compressed = compress_block(data, &config).unwrap();
         assert!(!compressed.is_empty()); // LZMA2 stream end marker
+    }
+
+    #[test]
+    fn test_concatenate_single_stream() {
+        let config = Lzma2Config::default();
+        let stream = compress_block(b"hello", &config).unwrap();
+        let original = stream.clone();
+        let result = concatenate_lzma2_streams(vec![stream]).unwrap();
+        assert_eq!(result, original);
+    }
+
+    #[test]
+    fn test_concatenate_multiple_streams() {
+        let config = Lzma2Config::default();
+        let s1 = compress_block(b"hello ", &config).unwrap();
+        let s2 = compress_block(b"world", &config).unwrap();
+
+        // Each stream ends with 0x00
+        assert_eq!(*s1.last().unwrap(), 0x00);
+        assert_eq!(*s2.last().unwrap(), 0x00);
+
+        let concatenated = concatenate_lzma2_streams(vec![s1.clone(), s2.clone()]).unwrap();
+
+        // Result should be s1 without terminator + s2 with terminator
+        let expected_len = s1.len() - 1 + s2.len();
+        assert_eq!(concatenated.len(), expected_len);
+        assert_eq!(*concatenated.last().unwrap(), 0x00);
+    }
+
+    #[test]
+    fn test_concatenate_empty_input() {
+        let result = concatenate_lzma2_streams(vec![]).unwrap();
+        assert_eq!(result, vec![0x00]);
+    }
+
+    #[test]
+    fn test_concatenate_invalid_stream() {
+        let result = concatenate_lzma2_streams(vec![vec![0xFF]]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_effective_block_size_default() {
+        let config = Lzma2Config::default();
+        let dict = config.effective_dict_size() as usize;
+        assert_eq!(config.effective_block_size(), 2 * dict);
+    }
+
+    #[test]
+    fn test_effective_block_size_custom() {
+        let config = Lzma2Config {
+            preset: 6,
+            dict_size: None,
+            block_size: Some(4096),
+        };
+        assert_eq!(config.effective_block_size(), 4096);
+    }
+
+    #[test]
+    fn test_effective_block_size_minimum() {
+        // Low preset with tiny dict: block_size should be at least 1 MiB
+        let config = Lzma2Config {
+            preset: 0,
+            dict_size: Some(4096),
+            block_size: None,
+        };
+        assert!(config.effective_block_size() >= 1 << 20);
     }
 }

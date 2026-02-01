@@ -1,3 +1,4 @@
+use sevenzip_mt::Lzma2Config;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::process::Command;
@@ -279,6 +280,62 @@ fn test_large_file_compression() {
     );
 
     let extracted = fs::read(extract_dir.join("large.bin")).unwrap();
+    assert_eq!(sha256_hex(&extracted), content_hash);
+    assert_eq!(extracted.len(), content.len());
+}
+
+#[test]
+fn test_intra_file_block_splitting() {
+    let dir = TempDir::new().unwrap();
+    let archive_path = dir.path().join("split.7z");
+    let extract_dir = dir.path().join("extracted");
+    fs::create_dir_all(&extract_dir).unwrap();
+
+    // 100 KiB of data with a small block_size (16 KiB) to force splitting
+    // into ~7 blocks, exercising parallel intra-file compression.
+    let content: Vec<u8> = (0..102_400).map(|i| (i % 251) as u8).collect();
+    let content_hash = sha256_hex(&content);
+
+    let file = fs::File::create(&archive_path).unwrap();
+    let mut archive = sevenzip_mt::SevenZipWriter::new(file).unwrap();
+    archive.set_config(Lzma2Config {
+        preset: 1,
+        dict_size: None,
+        block_size: Some(16_384), // 16 KiB blocks
+    });
+    archive.add_bytes("split.bin", &content).unwrap();
+    archive.finish().unwrap();
+
+    // Verify integrity with 7z
+    let output = Command::new("7z")
+        .args(["t", archive_path.to_str().unwrap()])
+        .output()
+        .expect("failed to run 7z");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "7z t failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    // Extract and verify content
+    let output = Command::new("7z")
+        .args([
+            "x",
+            archive_path.to_str().unwrap(),
+            &format!("-o{}", extract_dir.to_str().unwrap()),
+            "-y",
+        ])
+        .output()
+        .expect("failed to run 7z");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "7z x failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    let extracted = fs::read(extract_dir.join("split.bin")).unwrap();
     assert_eq!(sha256_hex(&extracted), content_hash);
     assert_eq!(extracted.len(), content.len());
 }

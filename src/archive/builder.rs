@@ -2,11 +2,22 @@ use crate::archive::header::{
     unix_to_filetime, ArchiveHeader, FileEntry, FolderInfo,
 };
 use crate::archive::writer::{write_signature_header, SIGNATURE_HEADER_SIZE};
-use crate::compression::lzma2::{encode_properties_byte, Lzma2Config};
+use crate::compression::lzma2::{concatenate_lzma2_streams, encode_properties_byte, Lzma2Config};
 use crate::error::{Result, SevenZipError};
 use crate::compression::block::RawBlock;
 use crate::threading::scheduler::compress_blocks_parallel;
 use std::io::{Seek, SeekFrom, Write};
+
+/// Metadata for a non-empty file, separated from its raw data so the data
+/// can be moved into RawBlocks without cloning.
+struct FileMeta {
+    name: String,
+    mtime: Option<u64>,
+    uncompressed_size: u64,
+    crc: u32,
+    /// Number of compressed blocks belonging to this file.
+    block_count: usize,
+}
 
 /// Input entry queued for inclusion in the archive.
 enum PendingEntry {
@@ -81,16 +92,17 @@ impl<W: Write + Seek> SevenZipWriter<W> {
     /// Finalizes the archive: compresses data, writes it, builds and writes the header,
     /// then seeks back to write the real SignatureHeader. Consumes self.
     pub fn finish(mut self) -> Result<W> {
-        // 1. Read all pending entries into (name, data, mtime) tuples
+        // 1. Read all pending entries into (name, data, mtime) tuples.
+        //    finish() takes self by value, so we move data out of entries — no clones.
         let mut file_inputs: Vec<(String, Vec<u8>, Option<u64>)> = Vec::new();
-        for entry in &self.entries {
+        for entry in self.entries {
             match entry {
                 PendingEntry::File {
                     disk_path,
                     archive_name,
                 } => {
-                    let data = std::fs::read(disk_path)?;
-                    let mtime = std::fs::metadata(disk_path)
+                    let data = std::fs::read(&disk_path)?;
+                    let mtime = std::fs::metadata(&disk_path)
                         .ok()
                         .and_then(|m| m.modified().ok())
                         .and_then(|t| {
@@ -98,69 +110,104 @@ impl<W: Write + Seek> SevenZipWriter<W> {
                                 .ok()
                                 .map(|d| unix_to_filetime(d.as_secs()))
                         });
-                    file_inputs.push((archive_name.clone(), data, mtime));
+                    file_inputs.push((archive_name, data, mtime));
                 }
                 PendingEntry::Bytes {
                     archive_name,
                     data,
                 } => {
-                    file_inputs.push((archive_name.clone(), data.clone(), None));
+                    file_inputs.push((archive_name, data, None));
                 }
             }
         }
 
-        // 2. Separate files with data from empty files
-        let mut files_with_data: Vec<(String, Vec<u8>, Option<u64>)> = Vec::new();
+        // 2. Split non-empty files into blocks for parallel compression.
+        //    Compute CRC over the full file data before splitting so we have
+        //    the correct whole-file CRC for the header.
+        let block_size = self.config.effective_block_size();
+        let mut file_metas: Vec<FileMeta> = Vec::new();
+        let mut raw_blocks: Vec<RawBlock> = Vec::new();
         let mut empty_files: Vec<(String, Option<u64>)> = Vec::new();
 
         for (name, data, mtime) in file_inputs {
             if data.is_empty() {
                 empty_files.push((name, mtime));
-            } else {
-                files_with_data.push((name, data, mtime));
+                continue;
             }
+
+            let uncompressed_size = data.len() as u64;
+            let crc = crc32fast::hash(&data);
+            let first_block = raw_blocks.len();
+
+            if data.len() <= block_size {
+                // Single block — move data directly (zero copy)
+                raw_blocks.push(RawBlock {
+                    data,
+                    block_index: first_block,
+                });
+            } else {
+                // Multiple blocks — split into chunks
+                for chunk in data.chunks(block_size) {
+                    raw_blocks.push(RawBlock {
+                        data: chunk.to_vec(),
+                        block_index: raw_blocks.len(),
+                    });
+                }
+            }
+
+            file_metas.push(FileMeta {
+                name,
+                mtime,
+                uncompressed_size,
+                crc,
+                block_count: raw_blocks.len() - first_block,
+            });
         }
 
-        // 3. Compress each file with data in parallel (one folder per file)
-        //    Each file is treated as a single block (no intra-file splitting for simplicity).
-        let raw_blocks: Vec<RawBlock> = files_with_data
-            .iter()
-            .enumerate()
-            .map(|(i, (_name, data, _mtime))| RawBlock {
-                data: data.clone(),
-                block_index: i,
-            })
-            .collect();
-
+        // 3. Compress all blocks in parallel
         let compressed_blocks = if raw_blocks.is_empty() {
             Vec::new()
         } else {
             compress_blocks_parallel(raw_blocks, &self.config)?
         };
 
-        // 4. Write compressed data sequentially
+        // 4. For each file, concatenate its compressed LZMA2 streams into a
+        //    single stream, then write it as one folder.
         let pack_position = 0u64; // compressed data starts right after SignatureHeader
         let mut folders = Vec::new();
         let mut file_entries = Vec::new();
         let properties_byte = encode_properties_byte(self.config.effective_dict_size());
 
-        for (i, block) in compressed_blocks.iter().enumerate() {
-            self.writer.write_all(&block.compressed_data)?;
+        let mut block_iter = compressed_blocks.into_iter();
 
-            let (name, _data, mtime) = &files_with_data[i];
+        for meta in &file_metas {
+            // Collect this file's compressed streams (moved, not cloned)
+            let mut streams: Vec<Vec<u8>> = Vec::with_capacity(meta.block_count);
+            for _ in 0..meta.block_count {
+                let block = block_iter.next().ok_or_else(|| {
+                    SevenZipError::Compression("unexpected end of compressed blocks".to_string())
+                })?;
+                streams.push(block.compressed_data);
+            }
+
+            let concatenated = concatenate_lzma2_streams(streams)?;
+            let compressed_size = concatenated.len() as u64;
+
+            self.writer.write_all(&concatenated)?;
+
             folders.push(FolderInfo {
-                compressed_size: block.compressed_size,
-                uncompressed_size: block.uncompressed_size,
-                uncompressed_crc: block.uncompressed_crc,
+                compressed_size,
+                uncompressed_size: meta.uncompressed_size,
+                uncompressed_crc: meta.crc,
                 lzma2_properties_byte: properties_byte,
             });
             file_entries.push(FileEntry {
-                name: name.clone(),
-                uncompressed_size: block.uncompressed_size,
-                compressed_size: block.compressed_size,
-                crc: block.uncompressed_crc,
+                name: meta.name.clone(),
+                uncompressed_size: meta.uncompressed_size,
+                compressed_size,
+                crc: meta.crc,
                 has_data: true,
-                modified_time: *mtime,
+                modified_time: meta.mtime,
             });
         }
 
