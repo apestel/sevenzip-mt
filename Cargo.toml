@@ -3,6 +3,10 @@ name = "sevenzip-mt"
 version = "0.1.0"
 edition = "2021"
 description = "Pure-Rust multi-threaded 7z archive creator with LZMA2 compression"
+license = "BSD-3-Clause"
+repository = "https://github.com/apestel/sevenzip-mt"
+keywords = ["7z", "7zip", "lzma2", "compression", "archive"]
+categories = ["compression"]
 
 [[bin]]
 name = "sevenzip-mt"
