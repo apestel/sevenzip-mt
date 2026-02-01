@@ -19,6 +19,9 @@ pub enum SevenZipError {
 
     #[error("archive already finalized")]
     AlreadyFinalized,
+
+    #[error("threading error: {0}")]
+    Threading(String),
 }
 
 pub type Result<T> = std::result::Result<T, SevenZipError>;

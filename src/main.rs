@@ -19,6 +19,10 @@ struct Cli {
     /// Compression level 0-9
     #[arg(short, long, default_value_t = 6)]
     level: u32,
+
+    /// Number of threads (default: number of logical CPUs)
+    #[arg(short, long)]
+    threads: Option<usize>,
 }
 
 fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
@@ -40,6 +44,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         dict_size: None,
         block_size: None,
     });
+    archive.set_num_threads(cli.threads);
 
     for path in &cli.files {
         let archive_name = path

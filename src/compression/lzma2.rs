@@ -92,7 +92,7 @@ fn decode_dict_size(prop: u8) -> u32 {
 }
 
 /// LZMA2 end-of-stream marker byte.
-const LZMA2_END_MARKER: u8 = 0x00;
+pub const LZMA2_END_MARKER: u8 = 0x00;
 
 /// Concatenates multiple independently-compressed LZMA2 streams into a single
 /// valid LZMA2 stream by stripping intermediate end-of-stream markers.
