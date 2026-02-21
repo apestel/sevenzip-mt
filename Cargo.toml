@@ -1,6 +1,6 @@
 [package]
 name = "sevenzip-mt"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Pure-Rust multi-threaded 7z archive creator with LZMA2 compression"
 license = "BSD-3-Clause"
@@ -14,7 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-lzma-rust2 = "0.15"
+lzma-rust2 = "0.16.2"
 rayon = "1.10"
 thiserror = "2"
 crc32fast = "1.4"
