@@ -1,7 +1,8 @@
-use sevenzip_mt::Lzma2Config;
+use sevenzip_mt::{Lzma2Config, ProgressStage};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -338,4 +339,97 @@ fn test_intra_file_block_splitting() {
     let extracted = fs::read(extract_dir.join("split.bin")).unwrap();
     assert_eq!(sha256_hex(&extracted), content_hash);
     assert_eq!(extracted.len(), content.len());
+}
+
+#[test]
+fn test_finish_with_progress() {
+    let dir = TempDir::new().unwrap();
+    let archive_path = dir.path().join("progress.7z");
+    let extract_dir = dir.path().join("extracted");
+    fs::create_dir_all(&extract_dir).unwrap();
+
+    let content: Vec<u8> = (0..102_400).map(|i| (i % 251) as u8).collect();
+    let content_hash = sha256_hex(&content);
+
+    let file = fs::File::create(&archive_path).unwrap();
+    let mut archive = sevenzip_mt::SevenZipWriter::new(file).unwrap();
+    archive.set_config(Lzma2Config {
+        preset: 1,
+        dict_size: None,
+        block_size: Some(16_384),
+    });
+    archive.add_bytes("progress.bin", &content).unwrap();
+
+    let reports = Arc::new(Mutex::new(Vec::new()));
+    let reports_clone = Arc::clone(&reports);
+    archive
+        .finish_with_progress(move |info| {
+            reports_clone.lock().unwrap().push(info.clone());
+        })
+        .unwrap();
+
+    let reports = Arc::try_unwrap(reports).unwrap().into_inner().unwrap();
+
+    // Must have received at least one report per stage
+    assert!(
+        reports.iter().any(|r| r.stage == ProgressStage::Reading),
+        "expected Reading stage reports"
+    );
+    assert!(
+        reports.iter().any(|r| r.stage == ProgressStage::Compressing),
+        "expected Compressing stage reports"
+    );
+    assert!(
+        reports.iter().any(|r| r.stage == ProgressStage::Writing),
+        "expected Writing stage reports"
+    );
+
+    // Percentages are non-decreasing (with small epsilon for floating-point)
+    for window in reports.windows(2) {
+        assert!(
+            window[1].percentage >= window[0].percentage - 1e-10,
+            "percentage went backwards: {} -> {}",
+            window[0].percentage,
+            window[1].percentage,
+        );
+    }
+
+    // First report starts at 0, last is 1.0
+    assert!(
+        (reports.first().unwrap().percentage - 0.0).abs() < f64::EPSILON,
+        "first report should be 0%"
+    );
+    assert!(
+        (reports.last().unwrap().percentage - 1.0).abs() < f64::EPSILON,
+        "last report should be 100%"
+    );
+
+    // Archive is still valid — verify with 7z
+    let output = Command::new("7z")
+        .args(["t", archive_path.to_str().unwrap()])
+        .output()
+        .expect("failed to run 7z");
+    assert!(
+        output.status.success(),
+        "7z t failed: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let output = Command::new("7z")
+        .args([
+            "x",
+            archive_path.to_str().unwrap(),
+            &format!("-o{}", extract_dir.to_str().unwrap()),
+            "-y",
+        ])
+        .output()
+        .expect("failed to run 7z");
+    assert!(
+        output.status.success(),
+        "7z x failed: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let extracted = fs::read(extract_dir.join("progress.bin")).unwrap();
+    assert_eq!(sha256_hex(&extracted), content_hash);
 }

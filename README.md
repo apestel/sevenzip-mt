@@ -64,6 +64,28 @@ archive.add_bytes("data.bin", &data)?;
 archive.finish()?;
 ```
 
+### Progress reporting
+
+Use `finish_with_progress` to get notified as the archive is built:
+
+```rust
+use sevenzip_mt::SevenZipWriter;
+
+let file = std::fs::File::create("archive.7z")?;
+let mut archive = SevenZipWriter::new(file)?;
+archive.add_bytes("data.bin", &data)?;
+
+archive.finish_with_progress(|info| {
+    println!("[{:?}] {:.0}%", info.stage, info.percentage * 100.0);
+})?;
+```
+
+The callback receives a `ProgressInfo` with:
+
+- `percentage` -- overall progress from 0.0 to 1.0
+- `stage` -- current phase (`Reading`, `Compressing`, or `Writing`)
+- `blocks_completed` / `blocks_total` -- block-level detail during compression
+
 ### Public API
 
 | Type | Description |
@@ -71,6 +93,8 @@ archive.finish()?;
 | `SevenZipWriter<W>` | Archive builder. `W: Write + Seek`. |
 | `Lzma2Config` | Compression configuration (preset, dict size, block size). |
 | `SevenZipError` | Error enum covering I/O, compression, header, threading. |
+| `ProgressInfo` | Progress data passed to the callback (percentage, stage, block counts). |
+| `ProgressStage` | Enum: `Reading`, `Compressing`, `Writing`. |
 
 **`SevenZipWriter` methods:**
 
@@ -82,6 +106,7 @@ archive.finish()?;
 | `add_file(disk_path, archive_name)` | Queue a file from disk. |
 | `add_bytes(archive_name, data)` | Queue in-memory data. |
 | `finish()` | Compress, write, and finalize the archive. Consumes `self`. |
+| `finish_with_progress(callback)` | Same as `finish()`, but calls `callback` with progress updates. |
 
 ## CLI
 

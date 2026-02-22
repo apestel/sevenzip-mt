@@ -5,8 +5,10 @@ use crate::archive::writer::{write_signature_header, SIGNATURE_HEADER_SIZE};
 use crate::compression::lzma2::{encode_properties_byte, Lzma2Config, LZMA2_END_MARKER};
 use crate::error::{Result, SevenZipError};
 use crate::compression::block::RawBlock;
+use crate::progress::{self, ProgressCallback, ProgressStage};
 use crate::threading::scheduler::compress_blocks_parallel;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::sync::Arc;
 
 /// Metadata for a non-empty file, separated from its raw data so the data
 /// can be moved into RawBlocks without cloning.
@@ -99,16 +101,40 @@ impl<W: Write + Seek> SevenZipWriter<W> {
 
     /// Finalizes the archive: compresses data, writes it, builds and writes the header,
     /// then seeks back to write the real SignatureHeader. Consumes self.
-    pub fn finish(mut self) -> Result<W> {
+    pub fn finish(self) -> Result<W> {
+        self.finish_internal(None)
+    }
+
+    /// Finalizes the archive like [`finish`](Self::finish), but calls `callback`
+    /// periodically with progress information.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use sevenzip_mt::SevenZipWriter;
+    ///
+    /// let file = std::fs::File::create("output.7z").unwrap();
+    /// let mut archive = SevenZipWriter::new(file).unwrap();
+    /// archive.add_bytes("data.bin", &[1, 2, 3]).unwrap();
+    /// archive.finish_with_progress(|info| {
+    ///     println!("{:.0}%", info.percentage * 100.0);
+    /// }).unwrap();
+    /// ```
+    pub fn finish_with_progress<F>(self, callback: F) -> Result<W>
+    where
+        F: Fn(&crate::progress::ProgressInfo) + Send + Sync + 'static,
+    {
+        self.finish_internal(Some(Arc::new(callback)))
+    }
+
+    fn finish_internal(mut self, progress: Option<ProgressCallback>) -> Result<W> {
         let block_size = self.config.effective_block_size();
         let mut file_metas: Vec<FileMeta> = Vec::new();
         let mut raw_blocks: Vec<RawBlock> = Vec::new();
         let mut empty_files: Vec<(String, Option<u64>)> = Vec::new();
 
-        // 1. Build RawBlocks from all entries.
-        //    - Disk files: read by chunks directly into RawBlocks (never hold
-        //      the full file as a single Vec), compute CRC incrementally.
-        //    - Memory entries: move or split data (zero-copy for single block).
+        // 1. Reading stage (0–5%)
+        progress::report(&progress, ProgressStage::Reading, 0.0, 0, 0);
+
         for entry in self.entries {
             match entry {
                 PendingEntry::File {
@@ -140,17 +166,26 @@ impl<W: Write + Seek> SevenZipWriter<W> {
             }
         }
 
-        // 2. Compress all blocks in parallel using a dedicated thread pool.
+        let total_blocks = raw_blocks.len();
+        progress::report(&progress, ProgressStage::Reading, 0.05, 0, total_blocks);
+
+        // 2. Compressing stage (5–95%)
         let compressed_blocks = if raw_blocks.is_empty() {
             Vec::new()
         } else {
-            compress_blocks_parallel(raw_blocks, &self.config, self.num_threads)?
+            progress::report(&progress, ProgressStage::Compressing, 0.05, 0, total_blocks);
+            compress_blocks_parallel(
+                raw_blocks,
+                &self.config,
+                self.num_threads,
+                &progress,
+                total_blocks,
+            )?
         };
 
-        // 3. Write compressed data directly to the output, one file at a time.
-        //    Each compressed block is written and immediately dropped (freed).
-        //    For multi-block files, intermediate LZMA2 end markers are stripped
-        //    inline — no concatenation buffer is allocated.
+        // 3. Writing stage (95–100%)
+        progress::report(&progress, ProgressStage::Writing, 0.95, total_blocks, total_blocks);
+
         let pack_position = 0u64;
         let mut folders = Vec::new();
         let mut file_entries = Vec::new();
@@ -181,7 +216,7 @@ impl<W: Write + Seek> SevenZipWriter<W> {
             });
         }
 
-        // 4. Add empty file entries (no folder for these)
+        // Add empty file entries (no folder for these)
         for (name, mtime) in &empty_files {
             file_entries.push(FileEntry {
                 name: name.clone(),
@@ -193,7 +228,7 @@ impl<W: Write + Seek> SevenZipWriter<W> {
             });
         }
 
-        // 5. Build and serialize the header
+        // Build and serialize the header
         let header = ArchiveHeader {
             folders,
             files: file_entries,
@@ -202,11 +237,11 @@ impl<W: Write + Seek> SevenZipWriter<W> {
         let header_bytes = header.serialize()?;
         let header_crc = crc32fast::hash(&header_bytes);
 
-        // 6. Write the header
+        // Write the header
         let header_offset_from_sig_end = self.writer.stream_position()? - SIGNATURE_HEADER_SIZE;
         self.writer.write_all(&header_bytes)?;
 
-        // 7. Seek back and write the real SignatureHeader
+        // Seek back and write the real SignatureHeader
         self.writer.seek(SeekFrom::Start(0))?;
         write_signature_header(
             &mut self.writer,
@@ -215,8 +250,10 @@ impl<W: Write + Seek> SevenZipWriter<W> {
             header_crc,
         )?;
 
-        // 8. Seek to end so the writer is in a clean state
+        // Seek to end so the writer is in a clean state
         self.writer.seek(SeekFrom::End(0))?;
+
+        progress::report(&progress, ProgressStage::Writing, 1.0, total_blocks, total_blocks);
 
         Ok(self.writer)
     }

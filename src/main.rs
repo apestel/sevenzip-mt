@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use clap::Parser;
-use sevenzip_mt::{Lzma2Config, SevenZipWriter};
+use sevenzip_mt::{Lzma2Config, ProgressStage, SevenZipWriter};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -56,7 +56,22 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         archive.add_file(&path.to_string_lossy(), archive_name)?;
     }
 
-    archive.finish()?;
+    archive.finish_with_progress(|info| {
+        let stage = match info.stage {
+            ProgressStage::Reading => "Reading",
+            ProgressStage::Compressing => "Compressing",
+            ProgressStage::Writing => "Writing",
+        };
+        if info.stage == ProgressStage::Compressing {
+            eprint!(
+                "\r  {stage} [{}/{}] {:.0}%  ",
+                info.blocks_completed, info.blocks_total, info.percentage * 100.0,
+            );
+        } else {
+            eprint!("\r  {stage}... {:.0}%  ", info.percentage * 100.0);
+        }
+    })?;
+    eprintln!();
 
     eprintln!(
         "Created {} with {} file(s)",
