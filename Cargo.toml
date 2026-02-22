@@ -1,6 +1,6 @@
 [package]
 name = "sevenzip-mt"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Pure-Rust multi-threaded 7z archive creator with LZMA2 compression"
 license = "BSD-3-Clause"
