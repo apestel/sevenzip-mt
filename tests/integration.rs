@@ -342,6 +342,78 @@ fn test_intra_file_block_splitting() {
 }
 
 #[test]
+fn test_file_spanning_multiple_batches() {
+    // Regression test: when a single file produces more blocks than batch_size,
+    // blocks from the first batch were written before block_file_map was
+    // populated (it was only filled after the file was fully read), causing
+    // an index-out-of-bounds panic. Force batch_size=1 via set_num_threads(1)
+    // so each block is its own batch.
+    let dir = TempDir::new().unwrap();
+    let archive_path = dir.path().join("multi_batch.7z");
+    let extract_dir = dir.path().join("extracted");
+    fs::create_dir_all(&extract_dir).unwrap();
+
+    // 80 KiB of data with 16 KiB blocks → 5 blocks, each in its own batch
+    let content: Vec<u8> = (0..81_920).map(|i| (i % 251) as u8).collect();
+    let content_hash = sha256_hex(&content);
+
+    // Also test with a disk file to cover the CurrentFileState path
+    let source_file = dir.path().join("source.bin");
+    fs::write(&source_file, &content).unwrap();
+
+    let file = fs::File::create(&archive_path).unwrap();
+    let mut archive = sevenzip_mt::SevenZipWriter::new(file).unwrap();
+    archive.set_config(Lzma2Config {
+        preset: 1,
+        dict_size: None,
+        block_size: Some(16_384), // 16 KiB blocks
+    });
+    archive.set_num_threads(Some(1)); // batch_size = 1
+    archive
+        .add_file(source_file.to_str().unwrap(), "from_disk.bin")
+        .unwrap();
+    archive.add_bytes("from_bytes.bin", &content).unwrap();
+    archive.finish().unwrap();
+
+    // Verify integrity
+    let output = Command::new("7z")
+        .args(["t", archive_path.to_str().unwrap()])
+        .output()
+        .expect("failed to run 7z");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "7z t failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    // Extract and verify content
+    let output = Command::new("7z")
+        .args([
+            "x",
+            archive_path.to_str().unwrap(),
+            &format!("-o{}", extract_dir.to_str().unwrap()),
+            "-y",
+        ])
+        .output()
+        .expect("failed to run 7z");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "7z x failed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    let extracted_disk = fs::read(extract_dir.join("from_disk.bin")).unwrap();
+    assert_eq!(sha256_hex(&extracted_disk), content_hash);
+    assert_eq!(extracted_disk.len(), content.len());
+
+    let extracted_bytes = fs::read(extract_dir.join("from_bytes.bin")).unwrap();
+    assert_eq!(sha256_hex(&extracted_bytes), content_hash);
+    assert_eq!(extracted_bytes.len(), content.len());
+}
+
+#[test]
 fn test_finish_with_progress() {
     let dir = TempDir::new().unwrap();
     let archive_path = dir.path().join("progress.7z");

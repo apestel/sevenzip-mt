@@ -42,8 +42,6 @@ struct CurrentFileState {
     hasher: crc32fast::Hasher,
     file_size: u64,
     remaining: u64,
-    first_block_index: usize,
-    blocks_emitted: usize,
 }
 
 /// Lazily produces batches of `RawBlock` from pending entries, reading from
@@ -68,9 +66,7 @@ struct PendingBytesState {
     archive_name: String,
     data: Vec<u8>,
     crc: u32,
-    first_block_index: usize,
     offset: usize,
-    blocks_emitted: usize,
 }
 
 impl BlockProducer {
@@ -103,33 +99,25 @@ impl BlockProducer {
 
                     let block_index = self.next_block_index;
                     self.next_block_index += 1;
-                    state.blocks_emitted += 1;
 
-                    // We don't know total blocks for this file up front from
-                    // the producer's perspective during emission, so we record
-                    // block_file_map entries after the file is finalized.
+
                     batch.push(RawBlock {
                         data: buf,
                         block_index,
                     });
                     state.remaining -= chunk_len as u64;
+
+                    // Eagerly record the file map entry so that blocks can be
+                    // written before the file is fully consumed.
+                    let file_index = self.file_metas.len();
+                    let is_last = state.remaining == 0;
+                    debug_assert_eq!(self.block_file_map.len(), block_index);
+                    self.block_file_map.push((file_index, is_last));
                 }
 
                 // If file fully read, finalize its metadata
                 if state.remaining == 0 {
                     let state = self.current_file.take().unwrap();
-                    let block_count = state.blocks_emitted;
-                    let file_index = self.file_metas.len();
-
-                    // Fill block_file_map for all blocks of this file
-                    for i in 0..block_count {
-                        let is_last = i == block_count - 1;
-                        debug_assert_eq!(
-                            self.block_file_map.len(),
-                            state.first_block_index + i
-                        );
-                        self.block_file_map.push((file_index, is_last));
-                    }
 
                     self.file_metas.push(FileMeta {
                         name: state.archive_name,
@@ -154,28 +142,23 @@ impl BlockProducer {
 
                     let block_index = self.next_block_index;
                     self.next_block_index += 1;
-                    pbs.blocks_emitted += 1;
+
 
                     batch.push(RawBlock {
                         data: chunk,
                         block_index,
                     });
+
+                    // Eagerly record the file map entry
+                    let file_index = self.file_metas.len();
+                    let is_last = pbs.offset >= pbs.data.len();
+                    debug_assert_eq!(self.block_file_map.len(), block_index);
+                    self.block_file_map.push((file_index, is_last));
                 }
 
                 // If bytes entry fully consumed, finalize
                 if pbs.offset >= pbs.data.len() {
                     let pbs = self.pending_bytes.take().unwrap();
-                    let block_count = pbs.blocks_emitted;
-                    let file_index = self.file_metas.len();
-
-                    for i in 0..block_count {
-                        let is_last = i == block_count - 1;
-                        debug_assert_eq!(
-                            self.block_file_map.len(),
-                            pbs.first_block_index + i
-                        );
-                        self.block_file_map.push((file_index, is_last));
-                    }
 
                     self.file_metas.push(FileMeta {
                         name: pbs.archive_name,
@@ -226,8 +209,6 @@ impl BlockProducer {
                         hasher: crc32fast::Hasher::new(),
                         file_size,
                         remaining: file_size,
-                        first_block_index: self.next_block_index,
-                        blocks_emitted: 0,
                     });
                     // Loop back to read blocks from this file
                 }
@@ -267,9 +248,7 @@ impl BlockProducer {
                             archive_name,
                             data,
                             crc,
-                            first_block_index: self.next_block_index,
                             offset: 0,
-                            blocks_emitted: 0,
                         });
                         // Loop back to split bytes
                     }
@@ -459,9 +438,14 @@ impl<W: Write + Seek> SevenZipWriter<W> {
 
             batch.sort_by_key(|b| b.block_index);
 
-            // Grow per_file_compressed as producer discovers new files
-            while per_file_compressed.len() < producer.file_metas.len() {
-                per_file_compressed.push(0);
+            // Grow per_file_compressed to cover all file indices referenced by
+            // block_file_map. This may exceed file_metas.len() when a file's
+            // blocks are emitted before the file is fully read (and its
+            // FileMeta entry pushed).
+            if let Some(&(max_file_idx, _)) = producer.block_file_map.last() {
+                while per_file_compressed.len() <= max_file_idx {
+                    per_file_compressed.push(0);
+                }
             }
 
             for block in &batch {
