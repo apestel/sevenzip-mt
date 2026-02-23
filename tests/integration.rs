@@ -376,12 +376,12 @@ fn test_finish_with_progress() {
         "expected Reading stage reports"
     );
     assert!(
-        reports.iter().any(|r| r.stage == ProgressStage::Compressing),
-        "expected Compressing stage reports"
+        reports.iter().any(|r| r.stage == ProgressStage::CompressingAndWriting),
+        "expected CompressingAndWriting stage reports"
     );
     assert!(
-        reports.iter().any(|r| r.stage == ProgressStage::Writing),
-        "expected Writing stage reports"
+        reports.iter().any(|r| r.stage == ProgressStage::Finalizing),
+        "expected Finalizing stage reports"
     );
 
     // Percentages are non-decreasing (with small epsilon for floating-point)

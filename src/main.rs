@@ -59,10 +59,10 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     archive.finish_with_progress(|info| {
         let stage = match info.stage {
             ProgressStage::Reading => "Reading",
-            ProgressStage::Compressing => "Compressing",
-            ProgressStage::Writing => "Writing",
+            ProgressStage::CompressingAndWriting => "Compressing",
+            ProgressStage::Finalizing => "Finalizing",
         };
-        if info.stage == ProgressStage::Compressing {
+        if info.stage == ProgressStage::CompressingAndWriting {
             eprint!(
                 "\r  {stage} [{}/{}] {:.0}%  ",
                 info.blocks_completed, info.blocks_total, info.percentage * 100.0,

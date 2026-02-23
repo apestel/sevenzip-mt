@@ -83,7 +83,7 @@ archive.finish_with_progress(|info| {
 The callback receives a `ProgressInfo` with:
 
 - `percentage` -- overall progress from 0.0 to 1.0
-- `stage` -- current phase (`Reading`, `Compressing`, or `Writing`)
+- `stage` -- current phase (`Reading`, `CompressingAndWriting`, or `Finalizing`)
 - `blocks_completed` / `blocks_total` -- block-level detail during compression
 
 ### Public API
@@ -94,7 +94,7 @@ The callback receives a `ProgressInfo` with:
 | `Lzma2Config` | Compression configuration (preset, dict size, block size). |
 | `SevenZipError` | Error enum covering I/O, compression, header, threading. |
 | `ProgressInfo` | Progress data passed to the callback (percentage, stage, block counts). |
-| `ProgressStage` | Enum: `Reading`, `Compressing`, `Writing`. |
+| `ProgressStage` | Enum: `Reading`, `CompressingAndWriting`, `Finalizing`. |
 
 **`SevenZipWriter` methods:**
 

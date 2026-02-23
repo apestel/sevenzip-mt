@@ -5,10 +5,10 @@ use std::sync::Arc;
 pub enum ProgressStage {
     /// Reading input files from disk into memory blocks.
     Reading,
-    /// Compressing blocks in parallel.
-    Compressing,
-    /// Writing compressed data and header to the output.
-    Writing,
+    /// Compressing blocks in parallel and writing them to the output.
+    CompressingAndWriting,
+    /// Writing the final header and signature (nearly instant).
+    Finalizing,
 }
 
 /// Progress information passed to the callback during `finish_with_progress`.
@@ -18,7 +18,7 @@ pub struct ProgressInfo {
     pub percentage: f64,
     /// Current stage.
     pub stage: ProgressStage,
-    /// Blocks completed so far (meaningful during Compressing stage).
+    /// Blocks completed so far (meaningful during CompressingAndWriting stage).
     pub blocks_completed: usize,
     /// Total number of blocks.
     pub blocks_total: usize,

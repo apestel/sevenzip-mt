@@ -4,9 +4,9 @@ use crate::archive::header::{
 use crate::archive::writer::{write_signature_header, SIGNATURE_HEADER_SIZE};
 use crate::compression::lzma2::{encode_properties_byte, Lzma2Config, LZMA2_END_MARKER};
 use crate::error::{Result, SevenZipError};
-use crate::compression::block::RawBlock;
+use crate::compression::block::{CompressedBlock, RawBlock};
 use crate::progress::{self, ProgressCallback, ProgressStage};
-use crate::threading::scheduler::compress_blocks_parallel;
+use crate::threading::scheduler::compress_blocks_parallel_streaming;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
 
@@ -169,37 +169,55 @@ impl<W: Write + Seek> SevenZipWriter<W> {
         let total_blocks = raw_blocks.len();
         progress::report(&progress, ProgressStage::Reading, 0.05, 0, total_blocks);
 
-        // 2. Compressing stage (5–95%)
-        let compressed_blocks = if raw_blocks.is_empty() {
-            Vec::new()
-        } else {
-            progress::report(&progress, ProgressStage::Compressing, 0.05, 0, total_blocks);
-            compress_blocks_parallel(
+        // Build a mapping from block_index -> (file_index, is_last_block_of_file)
+        // so we can write blocks individually as batches arrive.
+        let block_file_map = Self::build_block_file_map(&file_metas);
+
+        // Per-file accumulated compressed sizes, filled as blocks are written.
+        let mut per_file_compressed: Vec<u64> = vec![0; file_metas.len()];
+
+        let properties_byte = encode_properties_byte(self.config.effective_dict_size());
+
+        // Determine batch size: use num_threads or default to available CPUs.
+        let batch_size = self.num_threads.unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+        });
+
+        // 2. Compress + write stage (5–95%)
+        if !raw_blocks.is_empty() {
+            progress::report(&progress, ProgressStage::CompressingAndWriting, 0.05, 0, total_blocks);
+            compress_blocks_parallel_streaming(
                 raw_blocks,
                 &self.config,
                 self.num_threads,
                 &progress,
                 total_blocks,
-            )?
-        };
+                batch_size,
+                |batch| {
+                    for block in batch {
+                        Self::write_single_block(
+                            &mut self.writer,
+                            &block,
+                            &block_file_map,
+                            &mut per_file_compressed,
+                        )?;
+                    }
+                    Ok(())
+                },
+            )?;
+        }
 
-        // 3. Writing stage (95–100%)
-        progress::report(&progress, ProgressStage::Writing, 0.95, total_blocks, total_blocks);
+        // 3. Header stage (95–100%)
+        progress::report(&progress, ProgressStage::Finalizing, 0.95, total_blocks, total_blocks);
 
         let pack_position = 0u64;
         let mut folders = Vec::new();
         let mut file_entries = Vec::new();
-        let properties_byte = encode_properties_byte(self.config.effective_dict_size());
 
-        let mut block_iter = compressed_blocks.into_iter();
-
-        for meta in &file_metas {
-            let compressed_size = Self::write_file_blocks(
-                &mut self.writer,
-                &mut block_iter,
-                meta.block_count,
-            )?;
-
+        for (i, meta) in file_metas.iter().enumerate() {
+            let compressed_size = per_file_compressed[i];
             folders.push(FolderInfo {
                 compressed_size,
                 uncompressed_size: meta.uncompressed_size,
@@ -253,7 +271,7 @@ impl<W: Write + Seek> SevenZipWriter<W> {
         // Seek to end so the writer is in a clean state
         self.writer.seek(SeekFrom::End(0))?;
 
-        progress::report(&progress, ProgressStage::Writing, 1.0, total_blocks, total_blocks);
+        progress::report(&progress, ProgressStage::Finalizing, 1.0, total_blocks, total_blocks);
 
         Ok(self.writer)
     }
@@ -354,41 +372,49 @@ impl<W: Write + Seek> SevenZipWriter<W> {
         });
     }
 
-    /// Writes a file's compressed blocks directly to the output, stripping
-    /// intermediate LZMA2 end markers inline. Each block is dropped (freed)
-    /// immediately after writing. Returns total bytes written.
-    fn write_file_blocks(
-        writer: &mut W,
-        block_iter: &mut impl Iterator<Item = crate::compression::block::CompressedBlock>,
-        block_count: usize,
-    ) -> Result<u64> {
-        let mut compressed_size = 0u64;
-        let last_index = block_count - 1;
-
-        for i in 0..block_count {
-            let block = block_iter.next().ok_or_else(|| {
-                SevenZipError::Compression("unexpected end of compressed blocks".to_string())
-            })?;
-
-            if i < last_index {
-                // Intermediate block: strip the trailing LZMA2 end marker
-                let data = &block.compressed_data;
-                if data.last() != Some(&LZMA2_END_MARKER) {
-                    return Err(SevenZipError::Compression(
-                        "invalid LZMA2 stream: missing end-of-stream marker".to_string(),
-                    ));
-                }
-                let payload = &data[..data.len() - 1];
-                writer.write_all(payload)?;
-                compressed_size += payload.len() as u64;
-            } else {
-                // Last (or only) block: write as-is
-                writer.write_all(&block.compressed_data)?;
-                compressed_size += block.compressed_data.len() as u64;
+    /// Builds a mapping from global `block_index` to `(file_index, is_last_block_of_file)`.
+    /// This allows writing blocks in any order while tracking per-file metadata.
+    fn build_block_file_map(file_metas: &[FileMeta]) -> Vec<(usize, bool)> {
+        let total: usize = file_metas.iter().map(|m| m.block_count).sum();
+        let mut map = vec![(0usize, false); total];
+        let mut block_idx = 0;
+        for (file_idx, meta) in file_metas.iter().enumerate() {
+            for i in 0..meta.block_count {
+                let is_last = i == meta.block_count - 1;
+                map[block_idx] = (file_idx, is_last);
+                block_idx += 1;
             }
-            // `block` is dropped here — compressed_data freed immediately
+        }
+        map
+    }
+
+    /// Writes a single compressed block, stripping the LZMA2 end marker for
+    /// non-last blocks of a file. Accumulates compressed size in `per_file_compressed`.
+    fn write_single_block(
+        writer: &mut W,
+        block: &CompressedBlock,
+        block_file_map: &[(usize, bool)],
+        per_file_compressed: &mut [u64],
+    ) -> Result<()> {
+        let (file_idx, is_last) = block_file_map[block.block_index];
+
+        if is_last {
+            // Last (or only) block of this file: write as-is
+            writer.write_all(&block.compressed_data)?;
+            per_file_compressed[file_idx] += block.compressed_data.len() as u64;
+        } else {
+            // Intermediate block: strip the trailing LZMA2 end marker
+            let data = &block.compressed_data;
+            if data.last() != Some(&LZMA2_END_MARKER) {
+                return Err(SevenZipError::Compression(
+                    "invalid LZMA2 stream: missing end-of-stream marker".to_string(),
+                ));
+            }
+            let payload = &data[..data.len() - 1];
+            writer.write_all(payload)?;
+            per_file_compressed[file_idx] += payload.len() as u64;
         }
 
-        Ok(compressed_size)
+        Ok(())
     }
 }
