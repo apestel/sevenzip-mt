@@ -6,9 +6,12 @@ use crate::compression::lzma2::{encode_properties_byte, Lzma2Config, LZMA2_END_M
 use crate::error::{Result, SevenZipError};
 use crate::compression::block::{CompressedBlock, RawBlock};
 use crate::progress::{self, ProgressCallback, ProgressStage};
-use crate::threading::scheduler::compress_blocks_parallel_streaming;
+use crate::threading::scheduler::build_thread_pool;
+use crate::threading::worker::compress_raw_block;
+use rayon::prelude::*;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Metadata for a non-empty file, separated from its raw data so the data
 /// can be moved into RawBlocks without cloning.
@@ -17,8 +20,6 @@ struct FileMeta {
     mtime: Option<u64>,
     uncompressed_size: u64,
     crc: u32,
-    /// Number of compressed blocks belonging to this file.
-    block_count: usize,
 }
 
 /// Input entry queued for inclusion in the archive.
@@ -31,6 +32,277 @@ enum PendingEntry {
         archive_name: String,
         data: Vec<u8>,
     },
+}
+
+/// State for a file currently being read block-by-block.
+struct CurrentFileState {
+    reader: std::fs::File,
+    archive_name: String,
+    mtime: Option<u64>,
+    hasher: crc32fast::Hasher,
+    file_size: u64,
+    remaining: u64,
+    first_block_index: usize,
+    blocks_emitted: usize,
+}
+
+/// Lazily produces batches of `RawBlock` from pending entries, reading from
+/// disk incrementally so that at most `batch_size` raw blocks are in memory
+/// at any time.
+struct BlockProducer {
+    entries: std::vec::IntoIter<PendingEntry>,
+    block_size: usize,
+    current_file: Option<CurrentFileState>,
+    /// Bytes entries that have been taken from the iterator but not yet
+    /// fully consumed (for entries larger than the remaining batch capacity).
+    pending_bytes: Option<PendingBytesState>,
+    // Accumulated results (grow incrementally)
+    file_metas: Vec<FileMeta>,
+    empty_files: Vec<(String, Option<u64>)>,
+    block_file_map: Vec<(usize, bool)>,
+    next_block_index: usize,
+}
+
+/// State for an in-memory entry being split across batches.
+struct PendingBytesState {
+    archive_name: String,
+    data: Vec<u8>,
+    crc: u32,
+    first_block_index: usize,
+    offset: usize,
+    blocks_emitted: usize,
+}
+
+impl BlockProducer {
+    fn new(entries: Vec<PendingEntry>, block_size: usize) -> Self {
+        Self {
+            entries: entries.into_iter(),
+            block_size,
+            current_file: None,
+            pending_bytes: None,
+            file_metas: Vec::new(),
+            empty_files: Vec::new(),
+            block_file_map: Vec::new(),
+            next_block_index: 0,
+        }
+    }
+
+    /// Produces up to `batch_size` raw blocks. Returns an empty vec when all
+    /// entries are exhausted.
+    fn next_batch(&mut self, batch_size: usize) -> Result<Vec<RawBlock>> {
+        let mut batch = Vec::with_capacity(batch_size);
+
+        while batch.len() < batch_size {
+            // 1. Continue reading from a partially-consumed file
+            if let Some(ref mut state) = self.current_file {
+                while batch.len() < batch_size && state.remaining > 0 {
+                    let chunk_len = self.block_size.min(state.remaining as usize);
+                    let mut buf = vec![0u8; chunk_len];
+                    state.reader.read_exact(&mut buf)?;
+                    state.hasher.update(&buf);
+
+                    let block_index = self.next_block_index;
+                    self.next_block_index += 1;
+                    state.blocks_emitted += 1;
+
+                    // We don't know total blocks for this file up front from
+                    // the producer's perspective during emission, so we record
+                    // block_file_map entries after the file is finalized.
+                    batch.push(RawBlock {
+                        data: buf,
+                        block_index,
+                    });
+                    state.remaining -= chunk_len as u64;
+                }
+
+                // If file fully read, finalize its metadata
+                if state.remaining == 0 {
+                    let state = self.current_file.take().unwrap();
+                    let block_count = state.blocks_emitted;
+                    let file_index = self.file_metas.len();
+
+                    // Fill block_file_map for all blocks of this file
+                    for i in 0..block_count {
+                        let is_last = i == block_count - 1;
+                        debug_assert_eq!(
+                            self.block_file_map.len(),
+                            state.first_block_index + i
+                        );
+                        self.block_file_map.push((file_index, is_last));
+                    }
+
+                    self.file_metas.push(FileMeta {
+                        name: state.archive_name,
+                        mtime: state.mtime,
+                        uncompressed_size: state.file_size,
+                        crc: state.hasher.finalize(),
+                    });
+                }
+
+                if batch.len() >= batch_size {
+                    break;
+                }
+                continue;
+            }
+
+            // 2. Continue splitting a partially-consumed bytes entry
+            if let Some(ref mut pbs) = self.pending_bytes {
+                while batch.len() < batch_size && pbs.offset < pbs.data.len() {
+                    let end = (pbs.offset + self.block_size).min(pbs.data.len());
+                    let chunk = pbs.data[pbs.offset..end].to_vec();
+                    pbs.offset = end;
+
+                    let block_index = self.next_block_index;
+                    self.next_block_index += 1;
+                    pbs.blocks_emitted += 1;
+
+                    batch.push(RawBlock {
+                        data: chunk,
+                        block_index,
+                    });
+                }
+
+                // If bytes entry fully consumed, finalize
+                if pbs.offset >= pbs.data.len() {
+                    let pbs = self.pending_bytes.take().unwrap();
+                    let block_count = pbs.blocks_emitted;
+                    let file_index = self.file_metas.len();
+
+                    for i in 0..block_count {
+                        let is_last = i == block_count - 1;
+                        debug_assert_eq!(
+                            self.block_file_map.len(),
+                            pbs.first_block_index + i
+                        );
+                        self.block_file_map.push((file_index, is_last));
+                    }
+
+                    self.file_metas.push(FileMeta {
+                        name: pbs.archive_name,
+                        mtime: None,
+                        uncompressed_size: pbs.data.len() as u64,
+                        crc: pbs.crc,
+                    });
+                }
+
+                if batch.len() >= batch_size {
+                    break;
+                }
+                continue;
+            }
+
+            // 3. Get next entry from iterator
+            let entry = match self.entries.next() {
+                Some(e) => e,
+                None => break,
+            };
+
+            match entry {
+                PendingEntry::File {
+                    disk_path,
+                    archive_name,
+                } => {
+                    let metadata = std::fs::metadata(&disk_path)?;
+                    let mtime = metadata
+                        .modified()
+                        .ok()
+                        .and_then(|t| {
+                            t.duration_since(std::time::UNIX_EPOCH)
+                                .ok()
+                                .map(|d| unix_to_filetime(d.as_secs()))
+                        });
+                    let file_size = metadata.len();
+
+                    if file_size == 0 {
+                        self.empty_files.push((archive_name, mtime));
+                        continue;
+                    }
+
+                    let file = std::fs::File::open(&disk_path)?;
+                    self.current_file = Some(CurrentFileState {
+                        reader: file,
+                        archive_name,
+                        mtime,
+                        hasher: crc32fast::Hasher::new(),
+                        file_size,
+                        remaining: file_size,
+                        first_block_index: self.next_block_index,
+                        blocks_emitted: 0,
+                    });
+                    // Loop back to read blocks from this file
+                }
+                PendingEntry::Bytes {
+                    archive_name,
+                    data,
+                } => {
+                    if data.is_empty() {
+                        self.empty_files.push((archive_name, None));
+                        continue;
+                    }
+
+                    let crc = crc32fast::hash(&data);
+
+                    // For single-block data, emit directly without going through
+                    // PendingBytesState to allow zero-copy move.
+                    if data.len() <= self.block_size {
+                        let block_index = self.next_block_index;
+                        self.next_block_index += 1;
+
+                        let file_index = self.file_metas.len();
+                        self.block_file_map.push((file_index, true));
+
+                        self.file_metas.push(FileMeta {
+                            name: archive_name,
+                            mtime: None,
+                            uncompressed_size: data.len() as u64,
+                            crc,
+                        });
+
+                        batch.push(RawBlock {
+                            data,
+                            block_index,
+                        });
+                    } else {
+                        self.pending_bytes = Some(PendingBytesState {
+                            archive_name,
+                            data,
+                            crc,
+                            first_block_index: self.next_block_index,
+                            offset: 0,
+                            blocks_emitted: 0,
+                        });
+                        // Loop back to split bytes
+                    }
+                }
+            }
+        }
+
+        Ok(batch)
+    }
+}
+
+/// Estimates the total number of blocks across all entries by stat-ing files
+/// without reading any data. Returns `(total_blocks, total_bytes)`.
+fn estimate_block_count(entries: &[PendingEntry], block_size: usize) -> Result<(usize, u64)> {
+    let mut total_blocks = 0usize;
+    let mut total_bytes = 0u64;
+
+    for entry in entries {
+        let size = match entry {
+            PendingEntry::File { disk_path, .. } => {
+                let metadata = std::fs::metadata(disk_path)?;
+                metadata.len()
+            }
+            PendingEntry::Bytes { data, .. } => data.len() as u64,
+        };
+
+        if size > 0 {
+            total_blocks += ((size as usize) + block_size - 1) / block_size;
+            total_bytes += size;
+        }
+    }
+
+    Ok((total_blocks, total_bytes))
 }
 
 /// Creates valid 7z archives with LZMA2 compression and multi-threaded block compression.
@@ -128,53 +400,16 @@ impl<W: Write + Seek> SevenZipWriter<W> {
 
     fn finish_internal(mut self, progress: Option<ProgressCallback>) -> Result<W> {
         let block_size = self.config.effective_block_size();
-        let mut file_metas: Vec<FileMeta> = Vec::new();
-        let mut raw_blocks: Vec<RawBlock> = Vec::new();
-        let mut empty_files: Vec<(String, Option<u64>)> = Vec::new();
+
+        // Lightweight stat-only pass to estimate total blocks for progress.
+        let (total_blocks, _) = estimate_block_count(&self.entries, block_size)?;
 
         // 1. Reading stage (0–5%)
-        progress::report(&progress, ProgressStage::Reading, 0.0, 0, 0);
+        progress::report(&progress, ProgressStage::Reading, 0.0, 0, total_blocks);
 
-        for entry in self.entries {
-            match entry {
-                PendingEntry::File {
-                    disk_path,
-                    archive_name,
-                } => {
-                    Self::read_file_into_blocks(
-                        &disk_path,
-                        archive_name,
-                        block_size,
-                        &mut file_metas,
-                        &mut raw_blocks,
-                        &mut empty_files,
-                    )?;
-                }
-                PendingEntry::Bytes {
-                    archive_name,
-                    data,
-                } => {
-                    Self::split_bytes_into_blocks(
-                        archive_name,
-                        data,
-                        block_size,
-                        &mut file_metas,
-                        &mut raw_blocks,
-                        &mut empty_files,
-                    );
-                }
-            }
-        }
-
-        let total_blocks = raw_blocks.len();
-        progress::report(&progress, ProgressStage::Reading, 0.05, 0, total_blocks);
-
-        // Build a mapping from block_index -> (file_index, is_last_block_of_file)
-        // so we can write blocks individually as batches arrive.
-        let block_file_map = Self::build_block_file_map(&file_metas);
-
-        // Per-file accumulated compressed sizes, filled as blocks are written.
-        let mut per_file_compressed: Vec<u64> = vec![0; file_metas.len()];
+        let mut producer = BlockProducer::new(self.entries, block_size);
+        // Clear self.entries since it has been moved into the producer.
+        self.entries = Vec::new();
 
         let properties_byte = encode_properties_byte(self.config.effective_dict_size());
 
@@ -185,28 +420,64 @@ impl<W: Write + Seek> SevenZipWriter<W> {
                 .unwrap_or(4)
         });
 
-        // 2. Compress + write stage (5–95%)
-        if !raw_blocks.is_empty() {
-            progress::report(&progress, ProgressStage::CompressingAndWriting, 0.05, 0, total_blocks);
-            compress_blocks_parallel_streaming(
-                raw_blocks,
-                &self.config,
-                self.num_threads,
+        let pool = build_thread_pool(self.num_threads)?;
+        let completed = AtomicUsize::new(0);
+        let mut per_file_compressed: Vec<u64> = Vec::new();
+
+        // 2. Pipelined read → compress → write loop (5–95%)
+        progress::report(&progress, ProgressStage::Reading, 0.05, 0, total_blocks);
+
+        loop {
+            let chunk = producer.next_batch(batch_size)?;
+            if chunk.is_empty() {
+                break;
+            }
+
+            progress::report(
                 &progress,
+                ProgressStage::CompressingAndWriting,
+                0.05 + 0.90 * (completed.load(Ordering::Relaxed) as f64 / total_blocks.max(1) as f64),
+                completed.load(Ordering::Relaxed),
                 total_blocks,
-                batch_size,
-                |batch| {
-                    for block in batch {
-                        Self::write_single_block(
-                            &mut self.writer,
-                            &block,
-                            &block_file_map,
-                            &mut per_file_compressed,
-                        )?;
-                    }
-                    Ok(())
-                },
-            )?;
+            );
+
+            let config = &self.config;
+            let mut batch: Vec<CompressedBlock> = pool.install(|| {
+                chunk
+                    .into_par_iter()
+                    .map(|block| {
+                        let result = compress_raw_block(block, config);
+                        if result.is_ok() {
+                            let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                            let pct = 0.05 + 0.90 * (done as f64 / total_blocks.max(1) as f64);
+                            progress::report(&progress, ProgressStage::CompressingAndWriting, pct, done, total_blocks);
+                        }
+                        result
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })?;
+
+            batch.sort_by_key(|b| b.block_index);
+
+            // Grow per_file_compressed as producer discovers new files
+            while per_file_compressed.len() < producer.file_metas.len() {
+                per_file_compressed.push(0);
+            }
+
+            for block in &batch {
+                Self::write_single_block(
+                    &mut self.writer,
+                    block,
+                    &producer.block_file_map,
+                    &mut per_file_compressed,
+                )?;
+            }
+            // batch dropped here → compressed data freed
+        }
+
+        // Ensure per_file_compressed covers all files (in case last file had no blocks yet accounted)
+        while per_file_compressed.len() < producer.file_metas.len() {
+            per_file_compressed.push(0);
         }
 
         // 3. Header stage (95–100%)
@@ -216,7 +487,7 @@ impl<W: Write + Seek> SevenZipWriter<W> {
         let mut folders = Vec::new();
         let mut file_entries = Vec::new();
 
-        for (i, meta) in file_metas.iter().enumerate() {
+        for (i, meta) in producer.file_metas.iter().enumerate() {
             let compressed_size = per_file_compressed[i];
             folders.push(FolderInfo {
                 compressed_size,
@@ -235,7 +506,7 @@ impl<W: Write + Seek> SevenZipWriter<W> {
         }
 
         // Add empty file entries (no folder for these)
-        for (name, mtime) in &empty_files {
+        for (name, mtime) in &producer.empty_files {
             file_entries.push(FileEntry {
                 name: name.clone(),
                 uncompressed_size: 0,
@@ -274,118 +545,6 @@ impl<W: Write + Seek> SevenZipWriter<W> {
         progress::report(&progress, ProgressStage::Finalizing, 1.0, total_blocks, total_blocks);
 
         Ok(self.writer)
-    }
-
-    /// Reads a disk file by chunks directly into RawBlocks, computing CRC
-    /// incrementally. The full file is never loaded as a single allocation.
-    fn read_file_into_blocks(
-        disk_path: &std::path::Path,
-        archive_name: String,
-        block_size: usize,
-        file_metas: &mut Vec<FileMeta>,
-        raw_blocks: &mut Vec<RawBlock>,
-        empty_files: &mut Vec<(String, Option<u64>)>,
-    ) -> Result<()> {
-        let metadata = std::fs::metadata(disk_path)?;
-        let mtime = metadata
-            .modified()
-            .ok()
-            .and_then(|t| {
-                t.duration_since(std::time::UNIX_EPOCH)
-                    .ok()
-                    .map(|d| unix_to_filetime(d.as_secs()))
-            });
-        let file_size = metadata.len();
-
-        if file_size == 0 {
-            empty_files.push((archive_name, mtime));
-            return Ok(());
-        }
-
-        let mut file = std::fs::File::open(disk_path)?;
-        let mut hasher = crc32fast::Hasher::new();
-        let first_block = raw_blocks.len();
-        let mut remaining = file_size;
-
-        while remaining > 0 {
-            let chunk_len = block_size.min(remaining as usize);
-            let mut buf = vec![0u8; chunk_len];
-            file.read_exact(&mut buf)?;
-            hasher.update(&buf);
-            raw_blocks.push(RawBlock {
-                data: buf,
-                block_index: raw_blocks.len(),
-            });
-            remaining -= chunk_len as u64;
-        }
-
-        file_metas.push(FileMeta {
-            name: archive_name,
-            mtime,
-            uncompressed_size: file_size,
-            crc: hasher.finalize(),
-            block_count: raw_blocks.len() - first_block,
-        });
-
-        Ok(())
-    }
-
-    /// Splits in-memory data into RawBlocks. Single-block data is moved
-    /// directly (zero copy); larger data is split into chunks.
-    fn split_bytes_into_blocks(
-        archive_name: String,
-        data: Vec<u8>,
-        block_size: usize,
-        file_metas: &mut Vec<FileMeta>,
-        raw_blocks: &mut Vec<RawBlock>,
-        empty_files: &mut Vec<(String, Option<u64>)>,
-    ) {
-        if data.is_empty() {
-            empty_files.push((archive_name, None));
-            return;
-        }
-
-        let uncompressed_size = data.len() as u64;
-        let crc = crc32fast::hash(&data);
-        let first_block = raw_blocks.len();
-
-        if data.len() <= block_size {
-            raw_blocks.push(RawBlock {
-                data,
-                block_index: first_block,
-            });
-        } else {
-            for chunk in data.chunks(block_size) {
-                raw_blocks.push(RawBlock {
-                    data: chunk.to_vec(),
-                    block_index: raw_blocks.len(),
-                });
-            }
-        }
-
-        file_metas.push(FileMeta {
-            name: archive_name,
-            mtime: None,
-            uncompressed_size,
-            crc,
-            block_count: raw_blocks.len() - first_block,
-        });
-    }
-
-    /// Builds a mapping from global `block_index` to `(file_index, is_last_block_of_file)`.
-    /// This allows writing blocks in any order while tracking per-file metadata.
-    fn build_block_file_map(file_metas: &[FileMeta]) -> Vec<(usize, bool)> {
-        let total: usize = file_metas.iter().map(|m| m.block_count).sum();
-        let mut map = vec![(0usize, false); total];
-        let mut block_idx = 0;
-        for (file_idx, meta) in file_metas.iter().enumerate() {
-            for i in 0..meta.block_count {
-                let is_last = i == meta.block_count - 1;
-                map[block_idx] = (file_idx, is_last);
-                block_idx += 1;
-            }
-        }
-        map
     }
 
     /// Writes a single compressed block, stripping the LZMA2 end marker for

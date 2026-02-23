@@ -6,6 +6,18 @@ use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// Builds a rayon thread pool with the given number of threads.
+/// If `num_threads` is `None`, uses the number of available logical CPUs.
+pub fn build_thread_pool(num_threads: Option<usize>) -> Result<rayon::ThreadPool> {
+    let mut builder = ThreadPoolBuilder::new();
+    if let Some(n) = num_threads {
+        builder = builder.num_threads(n);
+    }
+    builder.build().map_err(|e| {
+        SevenZipError::Threading(format!("failed to build thread pool: {e}"))
+    })
+}
+
 /// Compresses multiple blocks in parallel using a dedicated rayon thread pool,
 /// returning them sorted by block_index.
 ///
